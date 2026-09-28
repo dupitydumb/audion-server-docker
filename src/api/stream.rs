@@ -332,7 +332,7 @@ pub async fn get_track_cover(
 
 pub async fn stream_track_subsonic(
     _claims: Claims,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     state: &AppState,
     id: i64,
     max_bitrate: Option<i32>,
@@ -359,6 +359,9 @@ pub async fn stream_track_subsonic(
     let storage = state.storage_backend.read().await;
     let is_s3 = matches!(&*storage, crate::storage::StorageBackend::S3 { .. } | crate::storage::StorageBackend::Azure { .. });
 
+    // "raw" means serve original file without transcoding
+    let want_raw = target_format.map(|f| f.eq_ignore_ascii_case("raw")).unwrap_or(false);
+
     // Determine if transcoding is requested
     let mut needs_transcode = false;
     let mut codec_name = "libmp3lame";
@@ -368,34 +371,36 @@ pub async fn stream_track_subsonic(
     let req_format = target_format.map(|f| f.to_lowercase());
     let current_format = format.as_deref().map(|f| f.to_lowercase());
 
-    if let Some(ref target) = req_format {
-        if current_format.as_ref() != Some(target) {
-            needs_transcode = true;
-            match target.as_str() {
-                "opus" | "ogg" => {
-                    codec_name = "libopus";
-                    mux_format = "ogg";
-                    mime_type = "audio/ogg";
-                }
-                "aac" | "m4a" => {
-                    codec_name = "aac";
-                    mux_format = "adts";
-                    mime_type = "audio/aac";
-                }
-                _ => {
-                    codec_name = "libmp3lame";
-                    mux_format = "mp3";
-                    mime_type = "audio/mpeg";
+    if !want_raw {
+        if let Some(ref target) = req_format {
+            if current_format.as_ref() != Some(target) {
+                needs_transcode = true;
+                match target.as_str() {
+                    "opus" | "ogg" => {
+                        codec_name = "libopus";
+                        mux_format = "ogg";
+                        mime_type = "audio/ogg";
+                    }
+                    "aac" | "m4a" => {
+                        codec_name = "aac";
+                        mux_format = "adts";
+                        mime_type = "audio/aac";
+                    }
+                    _ => {
+                        codec_name = "libmp3lame";
+                        mux_format = "mp3";
+                        mime_type = "audio/mpeg";
+                    }
                 }
             }
         }
-    }
 
-    let requested_bitrate_bps = max_bitrate.unwrap_or(0) * 1000;
-    if requested_bitrate_bps > 0 {
-        needs_transcode = true;
-    } else if current_format == Some("flac".to_string()) || current_format == Some("alac".to_string()) {
-        needs_transcode = true;
+        let requested_bitrate_bps = max_bitrate.unwrap_or(0) * 1000;
+        if requested_bitrate_bps > 0 {
+            needs_transcode = true;
+        } else if current_format == Some("flac".to_string()) || current_format == Some("alac".to_string()) {
+            needs_transcode = true;
+        }
     }
 
     if needs_transcode && state.has_ffmpeg {
@@ -489,9 +494,9 @@ pub async fn stream_track_subsonic(
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         }
     } else {
-        // Direct stream fallback local
+        // Direct stream fallback local — supports Range requests
         let stream_path = state.config.data_dir.join(&path);
-        let file = match File::open(&stream_path).await {
+        let mut file = match File::open(&stream_path).await {
             Ok(f) => f,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         };
@@ -502,15 +507,39 @@ pub async fn stream_track_subsonic(
         };
 
         let mime_type = mime_for_format(format.as_deref());
-        let stream = ReaderStream::new(file);
-        let body = Body::from_stream(stream);
 
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, file_size)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_TYPE, mime_type)
-            .body(body)
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        let range = headers.get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| parse_range(s, file_size));
+
+        match range {
+            Some((start, end)) => {
+                let len = end - start + 1;
+                if file.seek(SeekFrom::Start(start)).await.is_err() {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                let stream = ReaderStream::new(file.take(len));
+                let body = Body::from_stream(stream);
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size))
+                    .header(header::CONTENT_LENGTH, len)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_TYPE, mime_type)
+                    .body(body)
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+            None => {
+                let stream = ReaderStream::new(file);
+                let body = Body::from_stream(stream);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, file_size)
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(header::CONTENT_TYPE, mime_type)
+                    .body(body)
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+        }
     }
 }

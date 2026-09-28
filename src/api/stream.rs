@@ -363,6 +363,7 @@ pub async fn stream_track_subsonic(
     let want_raw = target_format.map(|f| f.eq_ignore_ascii_case("raw")).unwrap_or(false);
 
     // Determine if transcoding is requested
+    let requested_bitrate_bps = max_bitrate.unwrap_or(0) * 1000;
     let mut needs_transcode = false;
     let mut codec_name = "libmp3lame";
     let mut mux_format = "mp3";
@@ -395,7 +396,6 @@ pub async fn stream_track_subsonic(
             }
         }
 
-        let requested_bitrate_bps = max_bitrate.unwrap_or(0) * 1000;
         if requested_bitrate_bps > 0 {
             needs_transcode = true;
         } else if current_format == Some("flac".to_string()) || current_format == Some("alac".to_string()) {
